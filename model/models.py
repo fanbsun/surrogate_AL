@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import GPy
 import numpy as np
+import gpytorch
 
 # Define the device at the top of the file
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,6 +87,50 @@ def predict_gpr(model, xtest):
     std = np.sqrt(variance)
     return mean, std
 
+#GPR using GPyTorch on GPU
+class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=1.5))
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+def train_exactgpr(xtrain, ytrain, epochs, learning_rate):
+    ytrain = ytrain.squeeze(-1)
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    model = ExactGPModel(xtrain, ytrain, likelihood)
+    if torch.cuda.is_available():
+        model = model.to("cuda")
+        likelihood = likelihood.to("cuda")
+
+    model.train()
+    likelihood.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    for i in range(epochs):
+        optimizer.zero_grad()
+        output = model(xtrain)
+        loss = -mll(output, ytrain).mean()
+        loss.backward()
+        print('Iter %d/%d - Loss: %.4f   lengthscale: %.4f   noise: %.4f' % (
+            i + 1, epochs, loss.item(),
+            model.covar_module.base_kernel.lengthscale.item(),
+            model.likelihood.noise.item()
+        ))
+        optimizer.step()
+    return model, likelihood
+
+def predict_exactgpr(model, xtest):
+    model.eval()
+    with torch.no_grad():
+        f_preds = model(xtest)
+    return f_preds.mean, f_preds.variance
+    
 
 
 
