@@ -14,10 +14,11 @@ class BayesianLinear(nn.Module):
         super().__init__()
         self.mean = nn.Parameter(torch.randn(out_features, in_features) * weight_init_std)
         self.log_std = nn.Parameter(torch.randn(out_features, in_features) * log_std_init_std + log_std_init_mean)
+        self.b = nn.Parameter(torch.zeros(out_features))
 
     def forward(self, x):
         weights = self.mean + torch.randn_like(self.log_std) * torch.exp(self.log_std)
-        return F.linear(x, weights)
+        return F.linear(x, weights, self.b)
 
 class BayesianNeuralNetwork(nn.Module):
     def __init__(self, n_features, hidden_layers, weight_init_std, log_std_init_mean, log_std_init_std, log_std_clamp):
@@ -88,60 +89,6 @@ def predict_gpr(model, xtest):
 
 
 
-# Ensemble Model
-class NeuralNetwork(nn.Module):
-    def __init__(self, n_input, *neurons):
-        super(NeuralNetwork, self).__init__()
-        layers = []
-        prev_neurons = n_input
-        for n in neurons:
-            layers.extend([nn.Linear(prev_neurons, n), nn.ReLU()])
-            prev_neurons = n
-        layers.append(nn.Linear(prev_neurons, 1))
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
-
-def train_ensemble(model, optimizer, train_loader, train_loader_shuffled, epochs):
-    criterion = nn.MSELoss()
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-        for inputs, labels in train_loader_shuffled:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels.unsqueeze(1))  # Make sure labels are 2D
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-        
-        train_loss /= len(train_loader)
-        
-        print(f'Epoch {epoch+1}/{epochs} - Training Loss: {train_loss:.4f}')
-
-def predict_ensemble(models, data_loader):
-    for model in models:
-        model.eval()
-
-    predictions = []
-    actuals = []
-
-    with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs = inputs.to(device)
-            batch_predictions = [model(inputs).cpu().numpy() for model in models]
-            predictions.append(np.array(batch_predictions))
-            actuals.append(labels.cpu().numpy())  # Move labels to CPU before converting to numpy
-
-    predictions = np.concatenate(predictions, axis=1)
-    means = np.mean(predictions, axis=0).ravel()
-    stds = np.std(predictions, axis=0).ravel()
-    actuals = np.concatenate(actuals)
-
-    return means, stds, actuals
-
 # Monte Carlo Dropout
 class DropoutModel(nn.Module):
     def __init__(self, n_bits, n_1, n_2, n_3, dropout_rate):
@@ -156,7 +103,9 @@ class DropoutModel(nn.Module):
         x = F.relu(self.fc1(x))
         x = self.dropout(x) if apply_dropout else x
         x = F.relu(self.fc2(x))
+        x = self.dropout(x) if apply_dropout else x
         x = F.relu(self.fc3(x))
+        x = self.dropout(x) if apply_dropout else x
         return self.fc4(x)
 
 def train_mcd(model, train_loader, epochs, learning_rate):
@@ -172,10 +121,17 @@ def train_mcd(model, train_loader, epochs, learning_rate):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_loader):.2f}')
+        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_loader):.4f}')
+
+
+def enable_dropout(model):
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.train()
 
 def predict_mcd(model, data_loader, T):
     model.eval()
+    enable_dropout(model)
     all_predictions = []
     
     for _ in range(T):
