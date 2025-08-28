@@ -1,0 +1,11 @@
+model: bnn
+hidden_layers: [50,50]
+weight_init_std: 0.1
+log_std_init_mean: -3.0
+log_std_init_std: 0.1
+log_std_clamp: [-5,2]
+bnn_epochs: 500
+learning_rate: 0.01
+grad_clip_norm: 1.0
+n_mc_samples: 100
+batch_size: 32

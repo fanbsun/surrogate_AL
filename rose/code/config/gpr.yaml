@@ -1,0 +1,5 @@
+model: gpr
+kernel_variance: 1.0
+kernel_lengthscale: 1.0
+white_kernel_variance: 1.0
+max_iterations: 2000

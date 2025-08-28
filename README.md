@@ -1,0 +1,1 @@
+# Active Learning Framework(ROSE) for Training ML Surrogates on Ion Confinement Use Cases
