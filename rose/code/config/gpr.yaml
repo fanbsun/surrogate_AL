@@ -1,5 +1,6 @@
 model: gpr
-kernel_variance: 1.0
-kernel_lengthscale: 1.0
-white_kernel_variance: 1.0
-max_iterations: 2000
+epochs: 200
+learning_rate: 0.02
+min_delta: 1e-4
+patience: 100
+checkpoint_path: "checkpoints/best_exactgpr.pt"

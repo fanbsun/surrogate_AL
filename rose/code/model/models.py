@@ -163,32 +163,6 @@ def hybrid_loss_bnn(targets, distribution, beta=0.1, gamma=0.01):
     var_reg = torch.relu(0.1 - variance_pred.mean())
     return gamma*nll + mse + gamma*var_reg
 
-# class EarlyStopper:
-#     def __init__(self, patience=10, min_delta=0.0):
-#         """
-#         patience: # consecutive epochs allowed without sufficient improvement
-#         min_delta: required improvement in loss to reset patience (best - loss > min_delta)
-#         """
-#         self.patience = patience
-#         self.min_delta = float(min_delta)
-#         self.best_loss = float('inf')
-#         self.num_bad_epochs = 0
-#         self.best_state = None
-#         self.best_epoch = -1
-
-#     def step(self, loss_value, model, epoch_idx):
-#         improved = (self.best_loss - loss_value) > self.min_delta
-#         if improved:
-#             self.best_loss = loss_value
-#             self.num_bad_epochs = 0
-#             # Deep copy of state dict on CPU
-#             self.best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-#             self.best_epoch = epoch_idx
-#             return False, True  # stop=False, saved_best=True
-#         else:
-#             self.num_bad_epochs += 1
-#             return self.num_bad_epochs >= self.patience, False  # stop?, saved_best?
-
 
 def train_bnn(model, train_loader, epochs, learning_rate, grad_clip_norm, min_delta=1e-4, patience=10, checkpoint_path=None, load_best_on_end=True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -267,7 +241,7 @@ class ExactGPModel(gpytorch.models.ExactGP):
 
 def train_exactgpr(xtrain, ytrain, epochs, learning_rate, min_delta=1e-4, patience=10, checkpoint_path=None, load_best_on_end=True):
     ytrain = ytrain.squeeze(-1)  # ensure shape [N]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu" #torch.device("cuda" if torch.cuda.is_available() else "cpu")
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
     model = ExactGPModel(xtrain, ytrain, likelihood).to(device)
     model.train()
@@ -297,10 +271,6 @@ def train_exactgpr(xtrain, ytrain, epochs, learning_rate, min_delta=1e-4, patien
     return model, likelihood
 
 
-
-
-
-
 def predict_exactgpr(model, xtest):
     model.eval()
     with torch.no_grad():
@@ -309,60 +279,6 @@ def predict_exactgpr(model, xtest):
     
 
 
-
-# Ensemble Model
-class NeuralNetwork(nn.Module):
-    def __init__(self, n_input, *neurons):
-        super(NeuralNetwork, self).__init__()
-        layers = []
-        prev_neurons = n_input
-        for n in neurons:
-            layers.extend([nn.Linear(prev_neurons, n), nn.ReLU()])
-            prev_neurons = n
-        layers.append(nn.Linear(prev_neurons, 1))
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
-
-def train_ensemble(model, optimizer, train_loader, train_loader_shuffled, epochs):
-    criterion = nn.MSELoss()
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-        for inputs, labels in train_loader_shuffled:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels.unsqueeze(1))  # Make sure labels are 2D
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-        
-        train_loss /= len(train_loader)
-        
-        print(f'Epoch {epoch+1}/{epochs} - Training Loss: {train_loss:.4f}')
-
-def predict_ensemble(models, data_loader):
-    for model in models:
-        model.eval()
-
-    predictions = []
-    actuals = []
-
-    with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs = inputs.to(device)
-            batch_predictions = [model(inputs).cpu().numpy() for model in models]
-            predictions.append(np.array(batch_predictions))
-            actuals.append(labels.cpu().numpy())  # Move labels to CPU before converting to numpy
-
-    predictions = np.concatenate(predictions, axis=1)
-    means = np.mean(predictions, axis=0).ravel()
-    stds = np.std(predictions, axis=0).ravel()
-    actuals = np.concatenate(actuals)
-
-    return means, stds, actuals
 
 # Monte Carlo Dropout
 class DropoutModel(nn.Module):
@@ -383,20 +299,42 @@ class DropoutModel(nn.Module):
         x = self.dropout(x) if apply_dropout else x
         return self.fc4(x)
 
-def train_mcd(model, train_loader, epochs, learning_rate):
+def train_mcd(model, train_loader, epochs, learning_rate, min_delta=1e-4, patience=10, checkpoint_path=None, load_best_on_end=True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    device = next(model.parameters()).device
     criterion = nn.MSELoss()
+    stopper = EarlyStopper(patience=patience, min_delta=min_delta)
+    history = []
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        total_batches = 0
         for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
             output = model(data)
             loss = criterion(output, target)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_loader):.4f}')
+            total_batches += 1
+        avg_loss = total_loss / max(total_batches, 1)
+        history.append(avg_loss)
+        print(f"Epoch {epoch+1}/{epochs} - train loss: {avg_loss:.6f}")
+        stop, saved = stopper.step(avg_loss, epoch, model=model)
+        if saved and checkpoint_path is not None:
+            stopper.save_best(checkpoint_path)
+        if stop:
+            print(f"Early stop at {epoch+1}; best @ {stopper.best_epoch+1} loss={stopper.best_loss:.6f}")
+            break
+    if load_best_on_end and stopper.best_states is not None:
+        stopper.load_best(model=model)
+    return {
+        "train_loss_history": history,
+        "best_epoch": stopper.best_epoch,
+        "best_train_loss": stopper.best_loss,
+        "stopped_early": (len(history) - 1) != (epochs - 1)
+    }
 
 
 def enable_dropout(model):
@@ -404,22 +342,11 @@ def enable_dropout(model):
         if isinstance(m, nn.Dropout):
             m.train()
 
-def predict_mcd(model, data_loader, T):
+def predict_mcd(model, input_data, n_samples):
     model.eval()
     enable_dropout(model)
-    all_predictions = []
-    
-    for _ in range(T):
-        predictions = []
-        with torch.no_grad():
-            for inputs, _ in data_loader:
-                inputs = inputs.to(device)
-                outputs = model(inputs, apply_dropout=True)
-                predictions.append(outputs.cpu().numpy())
-        all_predictions.append(np.concatenate(predictions))
-    
-    all_predictions = np.array(all_predictions)
-    mean_pred = np.mean(all_predictions, axis=0).squeeze()
-    std_pred = np.std(all_predictions, axis=0).squeeze()
-    
-    return mean_pred, std_pred
+    #all_predictions = []
+
+    with torch.no_grad():
+        samples = torch.stack([model(input_data, apply_dropout=True) for _ in range(n_samples)])
+    return samples.mean(0), samples.std(0)

@@ -11,8 +11,9 @@ from rose.learner import Learner
 from radical.asyncflow import WorkflowEngine
 from radical.asyncflow import ConcurrentExecutionBackend
 from radical.asyncflow.logging import init_default_logger
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-from concurrent.futures import ProcessPoolExecutor
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -24,6 +25,497 @@ class LearnerResult:
     model_data: Dict[str, Any]
     success: bool
     killed: bool = False
+
+
+async def simulation_task(*args, **kwargs) -> Dict[str, Any]:
+    """Actual simulation task - exact logic from simulation.py"""
+    import os
+    import pickle
+    import numpy as np
+    import joblib
+    from sklearn.utils import shuffle
+    from utils import preprocess_inputdata, compute_peak_density, preprocess_inputdata_based_on_bins_positive, expand_input_output, collapse_input_output
+    
+    iteration = kwargs.get("iteration", 0)
+    input_data_dir = kwargs.get("input_data_dir", "")
+    seed = kwargs.get("seed", 42)
+    
+    print(f"Running simulation for iteration {iteration}")
+    
+    # Exact logic from simulation.py - Load preprocessed data
+    # with open(os.path.join(input_data_dir, 'data_dump_density_preprocessed_train.pk'), 'rb') as handle:
+    #     processed_all_data_preprocessed_train = pickle.load(handle)
+    # with open(os.path.join(input_data_dir, 'data_dump_density_preprocessed_test.pk'), 'rb') as handle:
+    #     processed_all_data_preprocessed_test = pickle.load(handle)
+
+    with open(os.path.join(input_data_dir, 'data_dump_density_preprocessed_train_V3.pk'), 'rb') as handle:
+        processed_all_data_preprocessed_train = pickle.load(handle)
+    with open(os.path.join(input_data_dir, 'data_dump_density_preprocessed_test_V3.pk'), 'rb') as handle:
+        processed_all_data_preprocessed_test = pickle.load(handle)
+
+    # Reduce training set size by randomly excluding N data
+    np.random.seed(seed)
+    index_ = np.random.choice(len(processed_all_data_preprocessed_train.keys()), 3545, replace=False)
+    excluded_index_ = np.delete(np.arange(0, len(processed_all_data_preprocessed_train.keys())), index_)
+    
+    train_ = {}
+    exclude_ = {}
+
+    for index in index_:
+        exclude_[list(processed_all_data_preprocessed_train.keys())[index]] = processed_all_data_preprocessed_train[list(processed_all_data_preprocessed_train.keys())[index]]
+    for index in excluded_index_:
+        train_[list(processed_all_data_preprocessed_train.keys())[index]] = processed_all_data_preprocessed_train[list(processed_all_data_preprocessed_train.keys())[index]]
+
+    # # Preprocess data to density output (NX1004)
+    # input_data, output, errors, z_data = preprocess_inputdata(train_)
+    # input_data_remain, output_remain, errors_remain, z_data_remain = preprocess_inputdata(exclude_)
+    # input_data_test, output_test_raw, errors_test_raw, z_data_test = preprocess_inputdata(processed_all_data_preprocessed_test)
+
+    # # Convert to peak density output (NX1)
+    # output_train, errors_train = compute_peak_density(input_data, output, errors, z_data)
+    # output_train_remain, errors_train_remain = compute_peak_density(input_data_remain, output_remain, errors_remain, z_data_remain)
+    # output_test, errors_test = compute_peak_density(input_data_test, output_test_raw, errors_test_raw, z_data_test)
+
+    input_data, output, errors, z_data = preprocess_inputdata_based_on_bins_positive(train_)
+    input_data_remain, output_train_remain, errors_train_remain, z_data_remain = preprocess_inputdata_based_on_bins_positive(exclude_)
+    input_data_test, output_test, errors_test, z_data_test = preprocess_inputdata_based_on_bins_positive(processed_all_data_preprocessed_test)
+
+    # Cross validation - split ranges 0.8 to 1
+    train_test_split = 1
+
+    # input_data_suff, output_suff, errors_suff, z_data_shuff = shuffle(
+    #     input_data, output_train, errors_train, z_data, random_state=seed
+    # )
+
+    input_data_suff, output_suff, errors_suff, z_data_shuff = shuffle(
+        input_data, output, errors, z_data, random_state=seed
+    )
+
+    train_test_split_ = int(input_data_suff.shape[0] * train_test_split)
+    
+    x_train = input_data_suff[0:train_test_split_]
+    x_test = input_data_suff[train_test_split_:]
+    y_train = output_suff[0:train_test_split_]
+    y_test = output_suff[train_test_split_:]
+    error_train = errors_suff[0:train_test_split_]
+    error_test = errors_suff[train_test_split_:]
+
+    print("Train input: ", x_train.shape)
+    print("Train Output", y_train.shape)
+    print("Test input: ", x_test.shape)
+    print("Test Output", y_test.shape)
+
+    # Load scalers and transform data
+    scaler = joblib.load(os.path.join(input_data_dir, 'scaler_new.pkl'))
+    scaled_x_train = scaler.transform(x_train)
+    scaled_x_test = scaler.transform(input_data_test)
+
+    # scaler_y = joblib.load(os.path.join(input_data_dir, 'minmax_scaler_peak_label.joblib'))
+    # scaler_error = joblib.load(os.path.join(input_data_dir, 'minmax_scaler_peak_error.joblib'))
+    scaler_y = joblib.load(os.path.join(input_data_dir, 'minmax_scaler_40_labels.joblib'))
+    scaler_error = joblib.load(os.path.join(input_data_dir, 'minmax_scaler_40_errors.joblib'))
+
+    scaled_y_train = scaler_y.transform(y_train)
+    scaled_y_test = scaler_y.transform(output_test)
+    scaled_error_train = scaler_error.transform(error_train)
+    scaled_error_test = scaler_error.transform(errors_test)
+
+    scaled_x_remain = scaler.transform(input_data_remain)
+    scaled_y_remain = scaler_y.transform(output_train_remain)
+    scaled_error_remain = scaler_error.transform(errors_train_remain)
+
+    # Augment data 
+    scaled_x_train = np.asarray(scaled_x_train, dtype=np.float64)
+    scaled_y_train = np.asarray(scaled_y_train, dtype=np.float64)
+    X_expanded_train, Y_expanded_train = expand_input_output(scaled_x_train, scaled_y_train)
+    print("Expanded input shape:", X_expanded_train.shape)   # (n, 8)
+    print("Expanded output shape:", Y_expanded_train.shape)  # (m, 1)
+
+    scaled_x_test = np.asarray(scaled_x_test, dtype=np.float64)
+    scaled_y_test = np.asarray(scaled_y_test, dtype=np.float64)
+    X_expanded_test, Y_expanded_test = expand_input_output(scaled_x_test, scaled_y_test)
+    print("Expanded input shape:", X_expanded_test.shape)   # (n, 8)
+    print("Expanded output shape:", Y_expanded_test.shape)  # (m, 1)
+
+    scaled_x_remain = np.asarray(scaled_x_remain, dtype=np.float64)
+    scaled_y_remain = np.asarray(scaled_y_remain, dtype=np.float64)
+    X_expanded_remain, Y_expanded_remain = expand_input_output(scaled_x_remain, scaled_y_remain)
+    print("Expanded input shape:", X_expanded_remain.shape)   # (n, 8)
+    print("Expanded output shape:", Y_expanded_remain.shape)  # (m, 1)
+
+    # Return dictionary instead of MLData object
+    # return {
+    #     "x_train": scaled_x_train,
+    #     "y_train": scaled_y_train,
+    #     "x_test": scaled_x_test,
+    #     "y_test": scaled_y_test,
+    #     "x_remain": scaled_x_remain,
+    #     "y_remain": scaled_y_remain,
+    #     "error_train": scaled_error_train,
+    #     "error_test": scaled_error_test,
+    #     "error_remain": scaled_error_remain,
+    #     "metadata": {
+    #         "iteration": iteration,
+    #         "train_shape": x_train.shape,
+    #         "test_shape": x_test.shape,
+    #         "remain_shape": scaled_x_remain.shape,
+    #         "scalers": {
+    #             "scaler": scaler,
+    #             "scaler_y": scaler_y,
+    #             "scaler_error": scaler_error
+    #         }
+    #     }
+    # }
+
+    return {
+        "x_train": X_expanded_train,
+        "y_train": Y_expanded_train,
+        "x_test": X_expanded_test,
+        "y_test":  Y_expanded_test,
+        "x_remain": X_expanded_remain,
+        "y_remain": Y_expanded_remain,
+        "error_train": scaled_error_train,
+        "error_test": scaled_error_test,
+        "error_remain": scaled_error_remain,
+        "metadata": {
+            "iteration": iteration,
+            "train_shape": x_train.shape,
+            "test_shape": x_test.shape,
+            "remain_shape": scaled_x_remain.shape,
+            "scalers": {
+                "scaler": scaler,
+                "scaler_y": scaler_y,
+                "scaler_error": scaler_error
+            }
+        }
+    }
+
+async def training_task(*args, **kwargs) -> Dict[str, Any]:
+    """Actual training task - NO timeout logic here anymore"""
+    import time
+    import yaml
+    import torch
+    import asyncio
+    import numpy as np
+    from model.models import EarlyStopper, BayesianNeuralNetwork, train_bnn, predict_bnn, train_exactgpr, predict_exactgpr, DropoutModel, train_mcd, predict_mcd, enable_dropout
+    import gpytorch
+    from torch.utils.data import TensorDataset, DataLoader
+    from utils import calculate_rmse, calculate_r2, calculate_spearman
+    import math, copy
+    
+    learner_id = kwargs.get("learner_id", 0)
+    iteration = kwargs.get("iteration", 0)
+    config_path = kwargs.get("config_path", "")
+    ml_data = kwargs.get("ml_data")
+    
+    if not isinstance(ml_data, dict):
+        raise ValueError("ml_data must be a dictionary")
+    
+    print(f"Learner {learner_id} starting training for iteration {iteration}")
+    
+    start_time = time.time()
+    
+    # Load config - exact logic from train.py
+    cfg = yaml.safe_load(open(config_path)) if config_path else {"model": "gpr"}
+    
+    # Use data directly from memory
+    x_train = ml_data["x_train"].copy()  # Make copies to avoid modifying original data
+    y_train = ml_data["y_train"].copy()
+    x_test = ml_data["x_test"].copy()
+    y_test = ml_data["y_test"].copy()
+
+    metrics = {
+        'rmse': None,
+        'training_size': len(x_train),
+        'test_size': len(x_test),
+        'std': None,
+        'R2': None,
+        'Spearman': None
+    }
+
+    # NO timeout logic here - just do the training
+    if cfg["model"] == "gpr":
+        # Exact GPR training logic from train.py
+        n_features = x_train.shape[1]
+        x_train_tensor = torch.FloatTensor(x_train)
+        y_train_tensor = torch.FloatTensor(y_train)
+        x_test_tensor = torch.FloatTensor(x_test)
+        y_test_tensor = torch.FloatTensor(y_test)
+        train_start = time.time()
+        with gpytorch.settings.fast_computations(covar_root_decomposition=False,
+                                                log_prob=False,
+                                                solves=False), \
+            gpytorch.settings.max_preconditioner_size(0), \
+            gpytorch.settings.skip_logdet_forward(False), \
+            gpytorch.settings.skip_posterior_variances(False):
+            device = 'cpu' #torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()           # frees unreferenced GPU memory
+            model, likelihood = train_exactgpr(x_train_tensor.to(device), y_train_tensor.to(device),
+                                cfg["epochs"],
+                                cfg["learning_rate"],
+                                cfg["min_delta"],
+                                cfg["patience"],
+                                cfg["checkpoint_path"])
+        train_time = time.time() - train_start
+
+        mean, std = predict_exactgpr(model, x_test_tensor.to(device))
+        rmse = calculate_rmse(y_test, mean.cpu().numpy())
+        r2 = calculate_r2(y_test, mean.cpu().numpy())
+        spearman = calculate_spearman(y_test, mean.cpu().numpy(), std.cpu().numpy())
+        metrics['rmse'] = rmse
+        metrics['std'] = std.detach().mean().item()
+        metrics['R2'] = r2
+        metrics['Spearman'] = spearman
+        print(f"Training time: {train_time:.2f} seconds | RMSE: {rmse:.4f}")
+        print(f"Prediction stats: Mean={mean.detach().mean().item():.4f} ± Std={std.detach().mean().item():.4f}")
+
+        training_result = {"model": model, "rmse": rmse, "std": std.detach().mean().item(), "R2": r2, "Spearman": spearman}
+
+    elif cfg["model"] == "bnn":
+        # Exact BNN training logic from train.py
+        n_features = x_train.shape[1]
+        x_train_tensor = torch.FloatTensor(x_train)
+        y_train_tensor = torch.FloatTensor(y_train)
+        x_test_tensor = torch.FloatTensor(x_test)
+        y_test_tensor = torch.FloatTensor(y_test)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = BayesianNeuralNetwork(
+            n_features,
+            cfg["hidden_layers"],
+            cfg["weight_init_std"],
+            cfg["log_std_init_mean"],
+            cfg["log_std_init_std"],
+            tuple(cfg["log_std_clamp"])
+        ).to(device)
+
+        train_dataset = TensorDataset(x_train_tensor, y_train_tensor)
+        train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True)
+
+        train_start = time.time()
+        train_bnn(model,
+                    train_loader,
+                    cfg["bnn_epochs"],
+                    cfg["learning_rate"],
+                    cfg["grad_clip_norm"],
+                    cfg["min_delta"],
+                    cfg["patience"],
+                    cfg["checkpoint_path"])
+        train_time = time.time() - train_start
+
+        with torch.no_grad():
+            test_preds, test_std = predict_bnn(model, x_test_tensor.to(device), n_samples=cfg["n_mc_samples"])
+
+        # Calculate RMSE
+        rmse = calculate_rmse(y_test, test_preds.cpu().numpy())
+        r2 = calculate_r2(y_test, test_preds.cpu().numpy())
+        spearman = calculate_spearman(y_test, test_preds.cpu().numpy(), test_std.cpu().numpy())
+        metrics['rmse'] = rmse
+        metrics['std'] = test_std.mean().item()
+        metrics['R2'] = r2
+        metrics['Spearman'] = spearman
+
+        print(f"Training time: {train_time:.2f} seconds | RMSE: {rmse:.4f}")
+        print(f"Prediction stats: Mean={test_preds.mean().item():.4f} ± Std={test_std.mean().item():.4f}")
+
+        training_result = {"model": model, "rmse": rmse, "std": test_std.mean().item(), "R2": r2, "Spearman": spearman}
+
+    elif cfg["model"] == "mcd":
+        n_features = x_train.shape[1]
+        x_train_tensor = torch.FloatTensor(x_train)
+        y_train_tensor = torch.FloatTensor(y_train)
+        x_test_tensor = torch.FloatTensor(x_test)
+        y_test_tensor = torch.FloatTensor(y_test)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = DropoutModel(
+            n_features,
+            cfg["hidden_layers_0"],
+            cfg["hidden_layers_1"],
+            cfg["hidden_layers_2"],
+            cfg["dropout"]).to(device)
+
+        train_dataset = TensorDataset(x_train_tensor, y_train_tensor)
+        train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True)
+
+        train_start = time.time()
+        train_mcd(model,
+                    train_loader,
+                    cfg["mcd_epochs"],
+                    cfg["learning_rate"],
+                    cfg["min_delta"],
+                    cfg["patience"],
+                    cfg["checkpoint_path"])
+        train_time = time.time() - train_start
+
+        with torch.no_grad():
+            test_preds, test_std = predict_mcd(model, x_test_tensor.to(device), n_samples=cfg["n_mc_samples"])
+
+        # Calculate RMSE
+        rmse = calculate_rmse(y_test, test_preds.cpu().numpy())
+        r2 = calculate_r2(y_test, test_preds.cpu().numpy())
+        spearman = calculate_spearman(y_test, test_preds.cpu().numpy(), test_std.cpu().numpy())
+        metrics['rmse'] = rmse
+        metrics['std'] = test_std.mean().item()
+        metrics['R2'] = r2
+        metrics['Spearman'] = spearman
+
+        print(f"Training time: {train_time:.2f} seconds | RMSE: {rmse:.4f}")
+        print(f"Prediction stats: Mean={test_preds.mean().item():.4f} ± Std={test_std.mean().item():.4f}")
+
+        training_result = {"model": model, "rmse": rmse, "std": test_std.mean().item(), "R2": r2, "Spearman": spearman}   
+    else:
+        raise Exception(f"Model of {cfg['model']} currently not supported!")
+
+    completion_time = time.time() - start_time
+
+    # Performance is inverse of RMSE (lower RMSE = higher performance)
+    #performance_score = max(0.1, 1.0 - training_result["rmse"])
+    performance_score = 0.9*training_result["R2"] + 0.1*training_result["Spearman"]
+
+    result = {
+        "learner_id": learner_id,
+        "performance_score": performance_score,
+        "completion_time": completion_time,
+        "iteration": iteration,
+        "model_params": {
+            "rmse": training_result["rmse"],
+            "training_size": metrics['training_size'],
+            "test_size": metrics['test_size'],
+            "std": training_result["std"],
+            "R2": training_result["R2"],
+            "Spearman": training_result["Spearman"]
+        },
+        "training_metadata": {
+            "model_type": cfg["model"],
+            "config": cfg
+        },
+        "trained_model": training_result["model"],  # Store actual trained model
+        "killed": False,
+        "success": True
+    }
+    
+    print(f"Learner {learner_id} completed in {completion_time:.1f}s (RMSE: {training_result['rmse']:.4f}) (R2: {training_result['R2']:.4f}) (performance_score: {performance_score:.4f}) (R2: {training_result['R2']:.4f}) (Spearman: {training_result['Spearman']:.4f})")
+    return result
+
+
+async def active_learn_task(*args, **kwargs) -> Dict[str, Any]:
+    """Actual active learning task - exact logic from active.py"""
+    import yaml
+    import torch
+    import numpy as np
+    import gpytorch
+    from model.models import EarlyStopper, BayesianNeuralNetwork, train_bnn, predict_bnn, train_exactgpr, predict_exactgpr, predict_mcd
+    
+    selected_learner = kwargs.get("selected_learner")
+    iteration = kwargs.get("iteration", 0)
+    config_path = kwargs.get("config_path", "")
+    ml_data = kwargs.get("ml_data")
+    n_new_samples = kwargs.get("n_new_samples", 5)
+
+    if not selected_learner:
+        return None
+
+    if not isinstance(ml_data, dict):
+        raise ValueError("ml_data must be a dictionary")
+    
+    print(f"Generating Data X from learner {selected_learner['learner_id']} for iteration {iteration + 1}")
+    
+    # Load config - exact logic from active.py
+    cfg = yaml.safe_load(open(config_path)) if config_path else {"model": "gpr"}
+    device = "cpu" #torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Use data directly from memory - make copies to avoid modifying original
+    x_train = ml_data["x_train"].copy()
+    y_train = ml_data["y_train"].copy()
+    x_remain = ml_data["x_remain"].copy() if ml_data.get("x_remain") is not None else None
+    y_remain = ml_data["y_remain"].copy() if ml_data.get("y_remain") is not None else None
+
+    if x_remain is None or y_remain is None:
+        print("No remaining data available for active learning")
+        return ml_data  # Return current data unchanged
+
+    # Get trained model from selected learner (in-memory instead of file loading)
+    trained_model = selected_learner.get('trained_model')
+    if not trained_model:
+        print("Warning: No trained model found, using random selection")
+        idx = np.random.choice(len(x_remain), min(n_new_samples, len(x_remain)), replace=False)
+    else:
+        # Exact active learning logic from active.py - but using in-memory model
+        if cfg["model"] == "gpr":
+            # Original: model = GPy.load(os.path.join(in_dir, "model.pkl"))
+            # Now: use the trained_model directly (it's already a GPy model from training task)
+            model = trained_model
+            torch.save(model.state_dict(), f"saved_model/gpr_model_state_{iteration}.pt")        #save model to the file path: saved_model/..
+            _, std_remain = predict_exactgpr(model, torch.FloatTensor(x_remain).to(device))
+            idx = np.argsort(std_remain.cpu().numpy().flatten())[-n_new_samples:]
+            
+        elif cfg["model"] == "bnn":
+            # Original: state = torch.load(os.path.join(in_dir, "model.pt"), map_location=device)
+            #           model.load_state_dict(state)
+            # Now: use the trained_model directly (it's already a trained BNN from training task)
+            n_features = x_train.shape[1]
+            model = trained_model  # This is already the trained BNN model
+            torch.save(model.state_dict(), f"saved_model/bnn_model_state_{iteration}.pt")        #save model to the file path: saved_model/..
+            model.to(device).eval()
+            _, std_remain = predict_bnn(model, torch.FloatTensor(x_remain).to(device), n_samples=cfg["n_mc_samples"])
+            idx = np.argsort(std_remain.cpu().numpy())[-n_new_samples:]
+        elif cfg["model"] == "mcd":
+            n_features = x_train.shape[1]
+            model = trained_model 
+            torch.save(model.state_dict(), f"saved_model/mcd_model_state_{iteration}.pt")        #save model to the file path: saved_model/..
+            model.to(device).eval()
+            _, std_remain = predict_mcd(model, torch.FloatTensor(x_remain).to(device), n_samples=cfg["n_mc_samples"])
+            idx = np.argsort(std_remain.cpu().numpy().flatten())[-n_new_samples:]         
+        else:
+            raise Exception(f"Model of {cfg['model']} currently not supported in active learning!")
+
+    # Update training data with selected samples - exact logic from active.py
+    x_train_new = np.vstack([x_train, x_remain[idx]])
+    y_train_new = np.vstack([y_train, y_remain[idx]])
+    
+    # Remove selected samples from remaining data
+    mask = np.ones(len(x_remain), bool)
+    mask[idx] = False
+    x_remain_new = x_remain[mask]
+    y_remain_new = y_remain[mask]
+    
+    # Handle error data if available
+    # error_train_new = ml_data.get("error_train")
+    # error_remain_new = ml_data.get("error_remain")
+    # if error_train_new is not None and error_remain_new is not None:
+    #     error_train_new = np.vstack([error_train_new, error_remain_new[idx]])
+    #     error_remain_new = error_remain_new[mask]
+
+    print(f"Selected {len(idx)} new samples. Training set: {len(x_train)} -> {len(x_train_new)}")
+    np.save(f"saved_data/scaled_x_train_{iteration}.npy",  x_train_new)
+    np.save(f"saved_data/scaled_y_train_{iteration}.npy",  y_train_new)
+
+    # Return updated dictionary
+    return {
+        "x_train": x_train_new,
+        "y_train": y_train_new,
+        "x_test": ml_data["x_test"],  # Test data remains the same
+        "y_test": ml_data["y_test"],
+        "x_remain": x_remain_new,
+        "y_remain": y_remain_new,
+        "error_train": None, #error_train_new,
+        "error_test": None, #ml_data.get("error_test"),  # Test error remains the same
+        "error_remain": None, # error_remain_new,
+        "metadata": {
+            **ml_data.get("metadata", {}),
+            "selected_samples": len(idx),
+            "new_training_size": len(x_train_new),
+            "remaining_samples": len(x_remain_new),
+            "source_learner": selected_learner['learner_id'],
+            "iteration": iteration + 1
+        }
+    }
+
+
+
+
 
 class SynchronizedLearner(Learner):
     
@@ -54,355 +546,10 @@ class SynchronizedLearner(Learner):
     def _setup_tasks(self):
         """Setup ROSE tasks using custom Learner approach"""
         
-        @self.simulation_task(as_executable=False)
-        async def simulation_task(*args, **kwargs) -> Dict[str, Any]:
-            """Actual simulation task - exact logic from simulation.py"""
-            import os
-            import pickle
-            import numpy as np
-            import joblib
-            from sklearn.utils import shuffle
-            from utils import preprocess_inputdata, compute_peak_density 
-            
-            iteration = kwargs.get("iteration", 0)
-            input_data_dir = kwargs.get("input_data_dir", "")
-            seed = kwargs.get("seed", 42)
-            
-            print(f"Running simulation for iteration {iteration}")
-            
-            # Exact logic from simulation.py - Load preprocessed data
-            with open(os.path.join(input_data_dir, 'data_dump_density_preprocessed_train.pk'), 'rb') as handle:
-                processed_all_data_preprocessed_train = pickle.load(handle)
-            with open(os.path.join(input_data_dir, 'data_dump_density_preprocessed_test.pk'), 'rb') as handle:
-                processed_all_data_preprocessed_test = pickle.load(handle)
+        self.simulation_task = self.simulation_task(as_executable=False)(simulation_task)
+        self.training_task = self.training_task(as_executable=False)(training_task)
+        self.active_learn_task = self.active_learn_task(as_executable=False)(active_learn_task)
 
-            # Reduce training set size by randomly excluding N data
-            np.random.seed(seed)
-            index_ = np.random.choice(len(processed_all_data_preprocessed_train.keys()), 3500, replace=False)
-            excluded_index_ = np.delete(np.arange(0, len(processed_all_data_preprocessed_train.keys())), index_)
-            
-            train_ = {}
-            exclude_ = {}
-
-            for index in index_:
-                exclude_[list(processed_all_data_preprocessed_train.keys())[index]] = processed_all_data_preprocessed_train[list(processed_all_data_preprocessed_train.keys())[index]]
-            for index in excluded_index_:
-                train_[list(processed_all_data_preprocessed_train.keys())[index]] = processed_all_data_preprocessed_train[list(processed_all_data_preprocessed_train.keys())[index]]
-
-            # Preprocess data to density output (NX1004)
-            input_data, output, errors, z_data = preprocess_inputdata(train_)
-            input_data_remain, output_remain, errors_remain, z_data_remain = preprocess_inputdata(exclude_)
-            input_data_test, output_test_raw, errors_test_raw, z_data_test = preprocess_inputdata(processed_all_data_preprocessed_test)
-
-            # Convert to peak density output (NX1)
-            output_train, errors_train = compute_peak_density(input_data, output, errors, z_data)
-            output_train_remain, errors_train_remain = compute_peak_density(input_data_remain, output_remain, errors_remain, z_data_remain)
-            output_test, errors_test = compute_peak_density(input_data_test, output_test_raw, errors_test_raw, z_data_test)
-
-            # Cross validation - split ranges 0.8 to 1
-            train_test_split = 1
-
-            input_data_suff, output_suff, errors_suff, z_data_shuff = shuffle(
-                input_data, output_train, errors_train, z_data, random_state=seed
-            )
-
-            train_test_split_ = int(input_data_suff.shape[0] * train_test_split)
-            
-            x_train = input_data_suff[0:train_test_split_]
-            x_test = input_data_suff[train_test_split_:]
-            y_train = output_suff[0:train_test_split_]
-            y_test = output_suff[train_test_split_:]
-            error_train = errors_suff[0:train_test_split_]
-            error_test = errors_suff[train_test_split_:]
-
-            print("Train input: ", x_train.shape)
-            print("Train Output", y_train.shape)
-            print("Test input: ", x_test.shape)
-            print("Test Output", y_test.shape)
-
-            # Load scalers and transform data
-            scaler = joblib.load(os.path.join(input_data_dir, 'scaler_new.pkl'))
-            scaled_x_train = scaler.transform(x_train)
-            scaled_x_test = scaler.transform(input_data_test)
-
-            scaler_y = joblib.load(os.path.join(input_data_dir, 'minmax_scaler_peak_label.joblib'))
-            scaler_error = joblib.load(os.path.join(input_data_dir, 'minmax_scaler_peak_error.joblib'))
-
-            scaled_y_train = scaler_y.transform(y_train)
-            scaled_y_test = scaler_y.transform(output_test)
-            scaled_error_train = scaler_error.transform(error_train)
-            scaled_error_test = scaler_error.transform(errors_test)
-
-            scaled_x_remain = scaler.transform(input_data_remain)
-            scaled_y_remain = scaler_y.transform(output_train_remain)
-            scaled_error_remain = scaler_error.transform(errors_train_remain)
-
-            # Return dictionary instead of MLData object
-            return {
-                "x_train": scaled_x_train,
-                "y_train": scaled_y_train,
-                "x_test": scaled_x_test,
-                "y_test": scaled_y_test,
-                "x_remain": scaled_x_remain,
-                "y_remain": scaled_y_remain,
-                "error_train": scaled_error_train,
-                "error_test": scaled_error_test,
-                "error_remain": scaled_error_remain,
-                "metadata": {
-                    "iteration": iteration,
-                    "train_shape": x_train.shape,
-                    "test_shape": x_test.shape,
-                    "remain_shape": scaled_x_remain.shape,
-                    "scalers": {
-                        "scaler": scaler,
-                        "scaler_y": scaler_y,
-                        "scaler_error": scaler_error
-                    }
-                }
-            }
-
-        @self.training_task(as_executable=False)
-        async def training_task(*args, **kwargs) -> Dict[str, Any]:
-            """Actual training task - NO timeout logic here anymore"""
-            import time
-            import yaml
-            import torch
-            import asyncio
-            import numpy as np
-            from model.models import BayesianNeuralNetwork, train_bnn, train_gpr, predict_bnn, predict_gpr
-            from torch.utils.data import TensorDataset, DataLoader
-            from utils import calculate_rmse
-            
-            learner_id = kwargs.get("learner_id", 0)
-            iteration = kwargs.get("iteration", 0)
-            config_path = kwargs.get("config_path", "")
-            ml_data = kwargs.get("ml_data")
-            
-            if not isinstance(ml_data, dict):
-                raise ValueError("ml_data must be a dictionary")
-            
-            print(f"Learner {learner_id} starting training for iteration {iteration}")
-            
-            start_time = time.time()
-            
-            # Load config - exact logic from train.py
-            cfg = yaml.safe_load(open(config_path)) if config_path else {"model": "gpr"}
-            
-            # Use data directly from memory
-            x_train = ml_data["x_train"].copy()  # Make copies to avoid modifying original data
-            y_train = ml_data["y_train"].copy()
-            x_test = ml_data["x_test"].copy()
-            y_test = ml_data["y_test"].copy()
-
-            metrics = {
-                'rmse': None,
-                'training_size': len(x_train),
-                'test_size': len(x_test),
-                'std': None
-            }
-
-            # NO timeout logic here - just do the training
-            if cfg["model"] == "gpr":
-                # Exact GPR training logic from train.py
-                train_start = time.time()
-                model = train_gpr(x_train, y_train,
-                                  cfg["kernel_variance"],
-                                  cfg["kernel_lengthscale"],
-                                  cfg["white_kernel_variance"],
-                                  cfg["max_iterations"])
-                train_time = time.time() - train_start
-
-                mean, std = predict_gpr(model, x_test)
-                rmse = calculate_rmse(y_test, mean)
-                metrics['rmse'] = rmse
-                metrics['std'] = np.mean(std)
-
-                print(f"Training time: {train_time:.2f} seconds | RMSE: {rmse:.4f}")
-                print(f"Prediction stats: Mean={np.mean(mean):.4f} � Std={np.mean(std):.4f}")
-
-                training_result = {"model": model, "rmse": rmse, "std": np.mean(std)}
-
-            elif cfg["model"] == "bnn":
-                # Exact BNN training logic from train.py
-                n_features = x_train.shape[1]
-                x_train_tensor = torch.FloatTensor(x_train)
-                y_train_tensor = torch.FloatTensor(y_train)
-                x_test_tensor = torch.FloatTensor(x_test)
-                y_test_tensor = torch.FloatTensor(y_test)
-
-                device = 'cpu'#torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                model = BayesianNeuralNetwork(
-                    n_features,
-                    cfg["hidden_layers"],
-                    cfg["weight_init_std"],
-                    cfg["log_std_init_mean"],
-                    cfg["log_std_init_std"],
-                    tuple(cfg["log_std_clamp"])
-                ).to(device)
-
-                train_dataset = TensorDataset(x_train_tensor, y_train_tensor)
-                train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True)
-
-                train_start = time.time()
-                train_bnn(model,
-                          train_loader,
-                          cfg["bnn_epochs"],
-                          cfg["learning_rate"],
-                          cfg["grad_clip_norm"])
-                train_time = time.time() - train_start
-
-                with torch.no_grad():
-                    test_preds, test_std = predict_bnn(model, x_test_tensor.to(device), n_samples=cfg["n_mc_samples"])
-
-                # Calculate RMSE
-                rmse = calculate_rmse(y_test, test_preds.cpu().numpy())
-                metrics['rmse'] = rmse
-                metrics['std'] = test_std.mean().item()
-
-                print(f"Training time: {train_time:.2f} seconds | RMSE: {rmse:.4f}")
-                print(f"Prediction stats: Mean={test_preds.mean().item():.4f} � Std={test_std.mean().item():.4f}")
-
-                training_result = {"model": model, "rmse": rmse, "std": test_std.mean().item()}
-            
-            else:
-                raise Exception(f"Model of {cfg['model']} currently not supported!")
-
-            completion_time = time.time() - start_time
-
-            # Performance is inverse of RMSE (lower RMSE = higher performance)
-            performance_score = max(0.1, 1.0 - training_result["rmse"])
-
-            result = {
-                "learner_id": learner_id,
-                "performance_score": performance_score,
-                "completion_time": completion_time,
-                "iteration": iteration,
-                "model_params": {
-                    "rmse": training_result["rmse"],
-                    "training_size": metrics['training_size'],
-                    "test_size": metrics['test_size'],
-                    "std": training_result["std"]
-                },
-                "training_metadata": {
-                    "model_type": cfg["model"],
-                    "config": cfg
-                },
-                "trained_model": training_result["model"],  # Store actual trained model
-                "killed": False,
-                "success": True
-            }
-            
-            print(f"Learner {learner_id} completed in {completion_time:.1f}s (RMSE: {training_result['rmse']:.4f})")
-            return result
-        
-        @self.active_learn_task(as_executable=False)
-        async def active_learn_task(*args, **kwargs) -> Dict[str, Any]:
-            """Actual active learning task - exact logic from active.py"""
-            import yaml
-            import torch
-            import numpy as np
-            import GPy
-            from model.models import predict_bnn, predict_gpr, BayesianNeuralNetwork
-            
-            selected_learner = kwargs.get("selected_learner")
-            iteration = kwargs.get("iteration", 0)
-            config_path = kwargs.get("config_path", "")
-            ml_data = kwargs.get("ml_data")
-            n_new_samples = kwargs.get("n_new_samples", 5)
-
-            if not selected_learner:
-                return None
-
-            if not isinstance(ml_data, dict):
-                raise ValueError("ml_data must be a dictionary")
-            
-            print(f"Generating Data X from learner {selected_learner['learner_id']} for iteration {iteration + 1}")
-            
-            # Load config - exact logic from active.py
-            cfg = yaml.safe_load(open(config_path)) if config_path else {"model": "gpr"}
-            device = 'cpu' #torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            
-            # Use data directly from memory - make copies to avoid modifying original
-            x_train = ml_data["x_train"].copy()
-            y_train = ml_data["y_train"].copy()
-            x_remain = ml_data["x_remain"].copy() if ml_data.get("x_remain") is not None else None
-            y_remain = ml_data["y_remain"].copy() if ml_data.get("y_remain") is not None else None
-
-            if x_remain is None or y_remain is None:
-                print("No remaining data available for active learning")
-                return ml_data  # Return current data unchanged
-
-            # Get trained model from selected learner (in-memory instead of file loading)
-            trained_model = selected_learner.get('trained_model')
-            if not trained_model:
-                print("Warning: No trained model found, using random selection")
-                idx = np.random.choice(len(x_remain), min(n_new_samples, len(x_remain)), replace=False)
-            else:
-                # Exact active learning logic from active.py - but using in-memory model
-                if cfg["model"] == "gpr":
-                    # Original: model = GPy.load(os.path.join(in_dir, "model.pkl"))
-                    # Now: use the trained_model directly (it's already a GPy model from training task)
-                    model = trained_model
-                    _, std_remain = predict_gpr(model, x_remain)
-                    idx = np.argsort(std_remain.flatten())[-n_new_samples:]
-                    
-                elif cfg["model"] == "bnn":
-                    # Original: state = torch.load(os.path.join(in_dir, "model.pt"), map_location=device)
-                    #           model.load_state_dict(state)
-                    # Now: use the trained_model directly (it's already a trained BNN from training task)
-                    n_features = x_train.shape[1]
-                    model = trained_model  # This is already the trained BNN model
-                    model.to(device).eval()
-                    _, std_remain = predict_bnn(model, torch.FloatTensor(x_remain).to(device), n_samples=cfg["n_mc_samples"])
-                    idx = np.argsort(std_remain.cpu().numpy())[-n_new_samples:]
-                    
-                else:
-                    raise Exception(f"Model of {cfg['model']} currently not supported in active learning!")
-
-            # Update training data with selected samples - exact logic from active.py
-            x_train_new = np.vstack([x_train, x_remain[idx]])
-            y_train_new = np.vstack([y_train, y_remain[idx]])
-            
-            # Remove selected samples from remaining data
-            mask = np.ones(len(x_remain), bool)
-            mask[idx] = False
-            x_remain_new = x_remain[mask]
-            y_remain_new = y_remain[mask]
-            
-            # Handle error data if available
-            error_train_new = ml_data.get("error_train")
-            error_remain_new = ml_data.get("error_remain")
-            if error_train_new is not None and error_remain_new is not None:
-                error_train_new = np.vstack([error_train_new, error_remain_new[idx]])
-                error_remain_new = error_remain_new[mask]
-
-            print(f"Selected {len(idx)} new samples. Training set: {len(x_train)} -> {len(x_train_new)}")
-
-            # Return updated dictionary
-            return {
-                "x_train": x_train_new,
-                "y_train": y_train_new,
-                "x_test": ml_data["x_test"],  # Test data remains the same
-                "y_test": ml_data["y_test"],
-                "x_remain": x_remain_new,
-                "y_remain": y_remain_new,
-                "error_train": error_train_new,
-                "error_test": ml_data.get("error_test"),  # Test error remains the same
-                "error_remain": error_remain_new,
-                "metadata": {
-                    **ml_data.get("metadata", {}),
-                    "selected_samples": len(idx),
-                    "new_training_size": len(x_train_new),
-                    "remaining_samples": len(x_remain_new),
-                    "source_learner": selected_learner['learner_id'],
-                    "iteration": iteration + 1
-                }
-            }
-
-        # Store task references
-        self.simulation_task = simulation_task
-        self.training_task = training_task
-        self.active_learn_task = active_learn_task
     
     def select_best_learner(self, completed_results: List[LearnerResult], iteration: int) -> Optional[Dict[str, Any]]:
         """Comparator function to select the best model from completed learners"""
@@ -606,6 +753,7 @@ class SynchronizedLearner(Learner):
             
             if best_learner:
                 logger.info(f"Best: Learner {best_learner['learner_id']} (score: {best_learner['performance_score']:.3f})")
+
             
             # Step 4: Generate Data X for next iteration (if not last iteration)
             data_x_generated = False
@@ -698,16 +846,16 @@ class SynchronizedLearner(Learner):
 
 async def main():
     """Example usage with your actual ML pipeline"""
-    
-    engine = await ConcurrentExecutionBackend(ProcessPoolExecutor())
+    engine = await ConcurrentExecutionBackend(ThreadPoolExecutor())
+    #engine = await ConcurrentExecutionBackend(ProcessPoolExecutor())
     init_default_logger(logging.DEBUG)
     asyncflow = await WorkflowEngine.create(engine)
 
     learner = SynchronizedLearner(
         asyncflow,
-        alpha=1.5,  # Kill threshold = 1.5 * first_completion_time (t_min calculated dynamically)
-        max_iterations=3,  # Reduced for testing
-        n_new_samples=5
+        alpha=1,  # Kill threshold = 1.5 * first_completion_time (t_min calculated dynamically)
+        max_iterations=10,  # Reduced for testing
+        n_new_samples=400
     )
 
     path = os.getcwd()
@@ -724,13 +872,13 @@ async def main():
             "learner_name": "GPR-01",
             "config_path": f"{os.path.join(path, 'config', 'gpr.yaml')}",
         },
-        {  # GPR learner 2 with different config
-            "learner_name": "GPR-02",
-            "config_path": f"{os.path.join(path, 'config', 'gpr_01.yaml')}", 
-        },
         {  # BNN learner 
             "learner_name": "BNN-01",
             "config_path": f"{os.path.join(path, 'config', 'bnn.yaml')}",
+        },
+        {  # MCD learner 
+            "learner_name": "MCD-01",
+            "config_path": f"{os.path.join(path, 'config', 'mcd.yaml')}",
         }
     ]
 
@@ -754,7 +902,9 @@ async def main():
             if result["final_best_learner"]:
                 best = result["final_best_learner"]
                 rmse = best.get('model_params', {}).get('rmse', 'N/A')
-                logger.info(f"Final best learner: {best['learner_id']} (RMSE: {rmse:.4f})")
+                r2 = best.get('model_params', {}).get('R2', 'N/A')
+                spearman = best.get('model_params', {}).get('Spearman', 'N/A')
+                logger.info(f"Final best learner: {best['learner_id']} (RMSE: {rmse:.4f}), (R2: {r2:.4f}), (Spearman: {spearman:.4f})")
 
             # Show final data statistics
             if result["final_ml_data"]:
@@ -768,7 +918,16 @@ async def main():
             # Performance progression
             if result["best_learner_history"]:
                 scores = [bl["performance_score"] for bl in result["best_learner_history"]]
+                learners_best = [ll["learner_id"] for ll in result["best_learner_history"]]
+                r2s = [rl["model_params"]["R2"] for rl in result["best_learner_history"]]
+                sps = [sl["model_params"]["Spearman"] for sl in result["best_learner_history"]]
+                time_perf = [tl["completion_time"] for tl in result["best_learner_history"]]
+
+                logger.info(f"Leaner ID: {' -> '.join([str(s) for s in learners_best])}")
                 logger.info(f"Performance progression: {' -> '.join([f'{s:.3f}' for s in scores])}")
+                logger.info(f"R2: {' -> '.join([f'{s:.3f}' for s in r2s])}")
+                logger.info(f"Spearman: {' -> '.join([f'{s:.3f}' for s in sps])}")
+                logger.info(f"Time: {' -> '.join([f'{s:.1f}' for s in time_perf])}")
         else:
             logger.info("Pipeline failed - no successful iterations")
     
